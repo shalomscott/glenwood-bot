@@ -1,71 +1,102 @@
-"use strict";
+'use strict';
 
-const Wit = require('node-wit').Wit,
-	getWeekday = require('./get-weekday'),
-	moment = require('moment'),
-	send = require('./send-response');
+const {Wit, log} = require('node-wit');
+const weekday = require('./weekday');
 
-// Environment variable set to app token
-const token = process.env.WIT_TOK;
+// Wit.ai parameters
+const WIT_TOKEN = process.env.WIT_TOKEN;
+if (!WIT_TOKEN) throw Error('missing WIT_TOKEN');
 
+// Setting up our bot
+const wit = new Wit({
+	accessToken: WIT_TOKEN,
+	actions,
+	logger: new log.Logger(log.INFO)
+});
+
+// Adding a method onto wit object
+wit.process = function(fbid, text) {
+	const ssid = getSessionID(fbid);
+	return this.runActions(ssid, text);
+}
+
+// Exports our slightly modified Wit object
+module.exports = wit;
+
+
+// ----- [ Session Managing ] -----
+
+// 'sessions' maps an existing session ID to an fbid and context object.
+// Key/value pairs are: sessionId -> { fbid, context }
+const sessions = {};
+
+// Gets or creates a sessionId corresponding to the fbid
+function getSessionID(fbid)
+{
+	for (let key in sessions) {
+		if (sessions[key].fbid === fbid)
+			return key; // the active sessionId
+	}
+
+	// No session found for user fbid, creating a new one
+	let sessionId = new Date().toISOString();
+	sessions[sessionId] = { fbid, context: {} };
+	return sessionId;
+}
+
+
+// ----- Bot Code -----
+
+// Bot's actions
 const actions = {
-	say: (sessionId, context, message, callback) => {
-		send.text(sessionId.split('&')[0], message); // split to get rid of query param
-		callback();
+	send({sessionId}, {text})
+	{
+		return Promise.resolve({ text });
 	},
-	merge: (sessionId, context, entities, message, callback) => {
-		console.log('In merge got object:  ', JSON.stringify(entities));
-		for (let entity in entities) {
-			context[entity] = entities[entity][0].value;
-		}
-		if (context.datetime) {
-			// fix start of week in case of Sunday
-			if (entities.datetime[0].grain === 'week' && moment().day() === 0) {
-				context.datetime = moment(context.datetime).add(1, 'w').format();
-			}
-			context.datetimebody = entities.datetime[0]._body;
-		}
-		// REVIEW: This may not be good enough
-		if (context.time === 'start' || (context.request === 'time' && !context.time)) {
-			context.shabbat = true;
-		}
-		callback(context);
+	// Retrieves a week segment from 'weekday/*.json' and stores it on the context object
+	weekday_search_by_date({sessionId, entities, context})
+	{
+		context = Object.assign(sessions[sessionId].context, context, entities);
+		return weekday.byDate(context.datetime && context.datetime[0].value)
+		.then(week => ({week}));
 	},
-	get_time: (sessionId, context, callback) => {
-		getWeekday.time(context.time, context.datetime).then((time) => {
-			context.retTime = (time.constructor === Array)?
-			time.reduce((prev, curr, i, a) => {
-				if (i === a.length - 1)
-					return prev + ' and ' + curr;
-				return prev + ', ' + curr;
-			}) : time;
-			callback(context);
-		})
-		.catch((err) => {
-			console.error('Error in get_time: ', err.message);
-		});
+	weekday_search_by_parsha({sessionId, entities, context})
+	{
+		context = Object.assign(sessions[sessionId].context, context, entities);
+		return weekday.byParsha(context.datetime && context.datetime[0].value)
+		.then(week => ({week}));
 	},
-	get_parsha: (sessionId, context, callback) => {
-		getWeekday.parsha(context.datetime).then((parsha) => {
-			context.parsha = parsha;
-			callback(context);
-		})
-		.catch((err) => {
-			console.error('Error in get_parsha: ', err.message);
-		});
-	},
-	error: (sessionId, context, error) => { console.error(error.message); }
-};
-
-const wit = new Wit(token, actions);
-
-module.exports = (senderId, message) => {
-	// needed sort of an injection to add the verbose query param
-	wit.runActions(senderId + '&verbose=true', message, {}, (err, context) => {
-		if (err) {
-			console.error('Got Wit error:', err.message, 'from user ID:', senderId);
-			return;
+	weekday_get_time({sessionId, entities, context})
+	{
+		let {time, week, datetime} =
+			Object.assign(sessions[sessionId].context, context, entities);
+		if (time) {
+			if (!week)
+				throw Error('No week object received.');
+			time = (time[0].value);
+			let date = datetime && datetime[0].value;
+			//delete sessions[sessionId]; // REVIEW
+			return Promise.resolve({
+				time: time.charAt(0).toUpperCase() + time.slice(1), // Uppercase the 'time'
+				timeRes: weekday.getProp(week, time, date) // TODO: weekday needs changing
+			});
 		}
-		console.log('Finished answering user with ID ', senderId);
-	});
+		return Promise.resolve({noTime: true});
+	},
+	weekday_get_parsha({sessionId, entities, context})
+	{
+		let {parsha, week, datetime} =
+			Object.assign(sessions[sessionId].context, context, entities);
+		if (parsha) {
+			if (!week)
+				throw Error('No week object received.');
+			let date = datetime && datetime[0].value;
+			//delete sessions[sessionId]; // REVIEW
+			return Promise.resolve({
+				parshaRes: weekday.getProp(week, 'parsha', date) // TODO: weekday needs changing
+			});
+		}
+		return Promise.resolve({noParsha: true}); // REVIEW
+	}
+	// TODO: implement actions here
 }
